@@ -1,12 +1,11 @@
 import logging
-import rasterio
 import pandas as pd
-import geopandas as gpd
 from pathlib import Path
 from datetime import datetime
 from pydantic import BaseModel
 from enum import Enum
-from shapely.geometry import box
+from typing import Tuple, Union
+from collections.abc import Generator
 
 
 logging.basicConfig()
@@ -35,7 +34,11 @@ def is_valid_image_type(image_type, ImageType: MSIImageType) -> bool:
     return image_type in ImageType.__members__.values()
 
 
-class GrusFileInfo(BaseModel):
+class FileInfo(BaseModel):
+    filepath: Path
+
+
+class GrusFileInfo(FileInfo):
     satellite_name: str
     acquisition_datetime: datetime
     product_level: str
@@ -44,6 +47,30 @@ class GrusFileInfo(BaseModel):
 
 class MSIFileInfo(GrusFileInfo):
     image_type: MSIImageType
+
+    def is_pan_msi_unique_image(cls, other: "MSIFileInfo") -> bool:
+        # 撮影日が同じかつCellIDが同じである、MSIとPAN画像であるか
+        # UDMファイルは対象外
+        if other.image_type == "PAN_UDM" or other.image_type == "MSI_UDM":
+            return False
+        if cls.image_type == "PAN_UDM" or cls.image_type == "MSI_UDM":
+            return False
+
+        is_unique_cell_id = cls.cell_id == other.cell_id
+        is_equal_datetime = cls.acquisition_datetime == other.acquisition_datetime
+        not_equal_image_type = cls.image_type != other.image_type
+        is_pan_and_msi = (cls.image_type == "MSI" and other.image_type == "PAN") or (
+            cls.image_type == "PAN" and other.image_type == "MSI"
+        )
+
+        LOGGER.debug(f"is_unique_cell_id : {is_unique_cell_id}")
+        LOGGER.debug(f"is_equal_datetime : {is_equal_datetime}")
+        LOGGER.debug(f"not_equal_image_type : {not_equal_image_type}")
+        LOGGER.debug(f"is_pan_and_msi : {is_pan_and_msi}")
+
+        return all(
+            [is_unique_cell_id, is_equal_datetime, not_equal_image_type, is_pan_and_msi]
+        )
 
 
 class TCIFileInfo(GrusFileInfo):
@@ -55,7 +82,8 @@ def spectral_band_min_max(band_id: int):
     return spectral_bands.loc[band_id, "min"], spectral_bands.loc[band_id, "max"]
 
 
-def parse_filename(filename: str) -> MSIFileInfo:
+def parse_filename(filepath: Path) -> Union[MSIFileInfo, TCIFileInfo]:
+    filename = filepath.stem
     parts = filename.split("_")
 
     LOGGER.debug(parts)
@@ -72,6 +100,7 @@ def parse_filename(filename: str) -> MSIFileInfo:
     acquisition_datetime = datetime.strptime(parts[1], "%Y%m%d%H%M%S")
 
     params = {
+        "filepath": filepath,
         "satellite_name": parts[0],
         "acquisition_datetime": acquisition_datetime,
         "product_level": parts[2],
@@ -85,24 +114,39 @@ def parse_filename(filename: str) -> MSIFileInfo:
         return TCIFileInfo(**params)
 
 
-def gen_geotiff_paths(root: Path):
+def gen_geotiff_paths(root: Path) -> Generator[Union[MSIFileInfo, TCIFileInfo]]:
     for path in root.rglob("*.tif"):
-        yield parse_filename(path.stem)
+        yield parse_filename(path)
 
 
-def tiff_to_geojson(tiff_file, dst_path: Path) -> None:
-    with rasterio.open(tiff_file) as src:
-        # GeoTIFFの範囲を取得
-        bounds = src.bounds
-        # 空間参照系を取得
-        crs = src.crs
+def get_each_equal_pan_and_msi_path(
+    root_path: Path,
+) -> Generator[Tuple[MSIFileInfo, TCIFileInfo]]:
+    """_summary_
+    撮影日とCellIDが同じであるPANとMSI画像のGeoTIFFファイルパスをgeneratorで返す
 
-    # 範囲をshapelyのbox形式に変換
-    aoi = box(*bounds)
+    Args:
+        root_path (Path): _description_
 
-    # GeoDataFrameの作成
-    gdf = gpd.GeoDataFrame({"geometry": [aoi]}, crs=crs)
-    gdf = gdf.to_crs("epsg:4326")
+    Yields:
+        _type_: _description_
+    """
+    gen_paths = gen_geotiff_paths(root_path)
+    msi_image_paths = []
+    for path in gen_paths:
+        if isinstance(path, MSIFileInfo):
+            msi_image_paths.append(path)
 
-    # ポリゴンをGeoJSON形式で書き出す
-    gdf.to_file(dst_path, driver="GeoJSON")
+    msi_paths = []
+    pan_paths = []
+
+    for path in msi_image_paths:
+        if path.image_type == "PAN":
+            pan_paths.append(path)
+        elif path.image_type == "MSI":
+            msi_paths.append(path)
+
+    for msi_path in msi_paths:
+        for pan_path in pan_paths:
+            if msi_path.is_pan_msi_unique_image(pan_path):
+                yield msi_path, pan_path
